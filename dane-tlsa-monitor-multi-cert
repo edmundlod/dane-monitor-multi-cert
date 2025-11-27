@@ -56,8 +56,8 @@ AUTH_NS=(
     "ns2.domain.tld"
 )
 
-# Path to danesmtp script
-DANESMTP="/usr/local/bin/danesmtp-extended"
+# Path to danesmtp script - leave empty to search PATH
+DANESMTP="${DANESMTP:-}"
 
 # Postfix configuration file
 POSTFIX_MAIN="/etc/postfix/main.cf"
@@ -76,6 +76,21 @@ DNSSEC_OK=1
 MLDSA_OK=1
 ECDSA_OK=1
 RSA_OK=1
+
+# Find danesmtp-extended if not set
+if [ -z "$DANESMTP" ]; then
+    if ! DANESMTP=$(command -v danesmtp-extended); then
+        echo "ERROR: danesmtp-extended not found in PATH" >&2
+        echo "Please install it or set DANESMTP=/path/to/danesmtp-extended" >&2
+        exit 1
+    fi
+fi
+
+# Verify it's executable
+if [ ! -x "$DANESMTP" ]; then
+    echo "ERROR: $DANESMTP is not executable" >&2
+    exit 1
+fi
 
 # Function to check DNSSEC against authoritative NS
 check_dnssec() {
