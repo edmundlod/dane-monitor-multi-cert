@@ -38,9 +38,9 @@ sudo dnf install \
 |---------|----------|----------|
 | `bash` | bash 4.0+ | Script execution |
 | `openssl` | openssl CLI | TLS certificate validation, DANE support |
-| `bind9-dnsutils`/`bind-utils` | dig, delv | DNS queries and DNSSEC validation |
+| `bind9-dnsutils` / `bind-utils` | dig, delv | DNS queries and DNSSEC validation |
 | `postfix` | postconf | Postfix configuration management |
-| `mailutils`/`mailx` | mail command | Email alerts |
+| `mailutils` / `mailx` | mail command | Email alerts |
 | `util-linux` | logger | Syslog logging |
 
 ### Custom Requirements
@@ -145,7 +145,7 @@ sudo $EDITOR /etc/systemd/system/dane-monitor-multi-cert.timer
 ```ini
 [Unit]
 Description=DANE TLSA Monitoring Timer
-Requires=dane-monitor.service
+Requires=dane-monitor-multi-cert.service
 
 [Timer]
 OnBootSec=5min
@@ -158,12 +158,12 @@ WantedBy=timers.target
 ```bash
 # Enable and start
 sudo systemctl daemon-reload
-sudo systemctl enable dane-monitor.timer
-sudo systemctl start dane-monitor.timer
+sudo systemctl enable dane-monitor-multi-cert.timer
+sudo systemctl start dane-monitor-multi-cert.timer
 
 # Verify
-systemctl status dane-monitor.timer
-systemctl list-timers dane-monitor.timer
+systemctl status dane-monitor-multi-cert.timer
+systemctl list-timers dane-monitor-multi-cert.timer
 ```
 
 **Option B: Cron**
@@ -172,8 +172,8 @@ crontab -e
 ```
 Add:
 ```cron
-# DANE monitoring - hourly checks
-0 * * * * /usr/local/bin/dane-monitor-multi-cert 2>&1 | logger -t dane-monitor-cron
+# DANE monitoring - every 30 minutes
+* /30 * * * /usr/local/bin/dane-monitor-multi-cert 2>&1 | logger -t dane-monitor-cron
 ```
 
 ### 5. Monitor Logs
@@ -187,4 +187,4 @@ tail -f /var/log/syslog | grep dane-monitor
 
 - Check logs: `journalctl -u dane-monitor-multi-cert.service`
 - Run manual test: `/usr/local/bin/dane-monitor-multi-cert`
-- Test individual components: `danesmtp mail.domain.tld
+- Test individual components: `danesmtp mail.domain.tld`
