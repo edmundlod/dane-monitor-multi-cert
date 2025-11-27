@@ -1,0 +1,344 @@
+#!/bin/bash
+# DANE TLSA Monitoring Script
+#
+# Automated validation of DANE TLSA records via Systemd timer
+# 
+# Checks performed:
+# - TLSA record consistency across all authoritative nameservers
+# - DNSSEC validation (ad flag present)
+# - TLS certificate validation for all three certificate types:
+#   * ML-DSA-65 (post-quantum)
+#   * ECDSA
+#   * RSA
+#
+# On failure:
+# - Automatically relaxes smtp_tls_security_level from 'dane' to 'encrypt' to preserve mail flow
+# - Sends detailed alerts to primary and backup email addresses
+# - Logs to syslog
+# - Provides actionable recovery steps
+#
+# All checks run to completion regardless of individual failures to provide
+# comprehensive diagnostics in a single run.
+#
+# All checks run to completion regardless of individual failures to provide
+# comprehensive diagnostics in a single run.
+#
+# REQUIREMENTS:
+# - bash >= 4.0
+# - OpenSSL with DANE support (openssl s_client -dane_tlsa_domain)
+# - dig (from bind-tools/dnsutils package)
+# - postfix with postconf command
+# - mail/mailx command for sending alerts
+# - logger command for syslog (usually provided by util-linux)
+# - danesmtp-extended script (custom, must be installed separately)
+# - Configured mail system to send outbound email
+#
+# OPTIONAL:
+# - delv (from bind-tools) for advanced DNSSEC debugging
+# - systemd for timer-based scheduling (alternative: cron)
+
+
+
+set -euo pipefail
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+MX_HOST="mail.domain.tld"
+DOMAIN="domain.tld"
+PRIMARY_EMAIL="my-email@domain.tld"
+BACKUP_EMAIL="my-email@otherdomain.com"
+
+# Authoritative nameservers for your domain
+AUTH_NS=(
+    "ns1.domain.tld"
+    "ns2.domain.tld"
+)
+
+# Path to danesmtp script
+DANESMTP="/usr/local/bin/danesmtp-extended"
+
+# Postfix configuration file
+POSTFIX_MAIN="/etc/postfix/main.cf"
+
+# DANE security levels
+DANE_ENFORCE_LEVEL="dane"           # Level that enforces DANE
+DANE_FALLBACK_LEVEL="encrypt"       # Safe fallback level
+
+# ============================================================================
+# END CONFIGURATION
+# ============================================================================
+
+# Track all errors
+ERRORS=""
+DNSSEC_OK=1
+MLDSA_OK=1
+ECDSA_OK=1
+RSA_OK=1
+
+# Function to check DNSSEC against authoritative NS
+check_dnssec() {
+    echo "Checking DNSSEC validation..." >&2
+    
+    # Temporarily disable errexit for this check
+    set +e
+    local dig_output
+    dig_output=$(dig +dnssec "_25._tcp.${MX_HOST}" TLSA 2>&1)
+    local dig_exit=$?
+    set -e
+    
+    if [ $dig_exit -ne 0 ]; then
+        ERRORS="${ERRORS}ERROR [DNSSEC]: dig command failed\n"
+        ERRORS="${ERRORS}  ${dig_output}\n\n"
+        return 1
+    fi
+    
+    if ! echo "$dig_output" | grep -q "ad;"; then
+        ERRORS="${ERRORS}ERROR [DNSSEC]: DNSSEC validation failed for _25._tcp.${MX_HOST}\n"
+        ERRORS="${ERRORS}  The 'ad' (authenticated data) flag is not set\n"
+        ERRORS="${ERRORS}  This means the DNSSEC chain is broken or incomplete\n\n"
+        return 1
+    fi
+    
+    echo "  ✓ DNSSEC validated (ad flag present)" >&2
+    return 0
+}
+
+# Function to check TLSA record consistency across nameservers
+check_tlsa_consistency() {
+    echo "Checking TLSA record consistency across nameservers..." >&2
+    
+    local first_response=""
+    local first_ns=""
+    local inconsistent=0
+    local no_response=0
+    
+    for ns in "${AUTH_NS[@]}"; do
+        echo "  Querying ${ns}..." >&2
+        
+        # Temporarily disable errexit
+        set +e
+        local response
+        response=$(dig +short "@${ns}" "_25._tcp.${MX_HOST}" TLSA 2>/dev/null | sort)
+        local dig_exit=$?
+        set -e
+        
+        if [ $dig_exit -ne 0 ] || [ -z "$response" ]; then
+            ERRORS="${ERRORS}ERROR [TLSA-${ns}]: No TLSA records returned from ${ns}\n"
+            no_response=1
+            continue
+        fi
+        
+        # Store first successful response for comparison
+        if [ -z "$first_response" ]; then
+            first_response="$response"
+            first_ns="$ns"
+            echo "    ✓ Baseline set ($(echo "$response" | wc -l) records)" >&2
+        elif [ "$first_response" != "$response" ]; then
+            ERRORS="${ERRORS}ERROR [TLSA]: Inconsistent TLSA records between nameservers!\n"
+            ERRORS="${ERRORS}  ${first_ns}:\n$(echo "$first_response" | sed 's/^/    /')\n"
+            ERRORS="${ERRORS}  ${ns}:\n$(echo "$response" | sed 's/^/    /')\n\n"
+            inconsistent=1
+        else
+            echo "    ✓ Matches baseline" >&2
+        fi
+    done
+    
+    if [ $no_response -eq 1 ] || [ $inconsistent -eq 1 ]; then
+        return 1
+    fi
+    
+    echo "  ✓ All nameservers have consistent TLSA records" >&2
+    return 0
+}
+
+# Function to check a specific certificate type
+check_cert_type() {
+    local label="$1"
+    local sig_arg="$2"  # empty for ML-DSA-65 (default), "rsa", or "ecdsa"
+    
+    echo "Checking ${label}..." >&2
+    
+    # Temporarily disable errexit
+    set +e
+    local output
+    local exit_code
+    
+    if [ -z "$sig_arg" ]; then
+        output=$("$DANESMTP" "$MX_HOST" 2>&1)
+        exit_code=$?
+    else
+        output=$("$DANESMTP" -s "$sig_arg" "$MX_HOST" 2>&1)
+        exit_code=$?
+    fi
+    set -e
+    
+    if [ $exit_code -ne 0 ]; then
+        ERRORS="${ERRORS}ERROR [${label}]: DANE validation failed\n"
+        ERRORS="${ERRORS}$(echo "$output" | grep -E "(FAILED|WARNING|ERROR|Verify return code)" | sed 's/^/  /')\n\n"
+        return 1
+    fi
+    
+    # Check for verification errors in output
+    if echo "$output" | grep -q "Verify return code.*[^0]"; then
+        ERRORS="${ERRORS}ERROR [${label}]: Certificate verification failed\n"
+        ERRORS="${ERRORS}$(echo "$output" | grep "Verify return code" | sed 's/^/  /')\n\n"
+        return 1
+    fi
+    
+    # Check for TLSA warnings
+    if echo "$output" | grep -qi "WARNING.*TLSA"; then
+        ERRORS="${ERRORS}WARNING [${label}]: TLSA record issue detected\n"
+        ERRORS="${ERRORS}$(echo "$output" | grep -i "WARNING.*TLSA" | sed 's/^/  /')\n\n"
+        return 1
+    fi
+    
+    echo "  ✓ ${label} validation successful" >&2
+    return 0
+}
+
+# Main checks - run ALL checks regardless of individual failures
+echo "========================================" >&2
+echo "DANE Monitoring Check: $(date)" >&2
+echo "Host: ${MX_HOST}" >&2
+echo "========================================" >&2
+
+# Check TLSA consistency across all authoritative nameservers first
+# Use || to prevent script exit on check failure
+check_tlsa_consistency || DNSSEC_OK=0
+
+# Check DNSSEC validation
+check_dnssec || DNSSEC_OK=0
+
+# Check each certificate type
+# ML-DSA-65: no -s flag (OpenSSL negotiates it by default)
+check_cert_type "ML-DSA-65" "" || MLDSA_OK=0
+
+# ECDSA: use -s ecdsa
+check_cert_type "ECDSA" "ecdsa" || ECDSA_OK=0
+
+# RSA: use -s rsa
+check_cert_type "RSA" "rsa" || RSA_OK=0
+
+# If ANY errors found, take action
+if [ -n "$ERRORS" ]; then
+    echo "========================================" >&2
+    echo "ERRORS DETECTED!" >&2
+    echo "========================================" >&2
+    
+    # Build summary
+    SUMMARY="DANE Check Failed:\n"
+    [ $DNSSEC_OK -eq 0 ] && SUMMARY="${SUMMARY}  ✗ DNSSEC/TLSA Consistency\n"
+    [ $MLDSA_OK -eq 0 ] && SUMMARY="${SUMMARY}  ✗ ML-DSA-65\n"
+    [ $ECDSA_OK -eq 0 ] && SUMMARY="${SUMMARY}  ✗ ECDSA\n"
+    [ $RSA_OK -eq 0 ] && SUMMARY="${SUMMARY}  ✗ RSA\n"
+    
+    # Get current DANE enforcement level
+    CURRENT_LEVEL=$(postconf -h smtp_tls_security_level)
+    
+    # Build recovery instructions dynamically
+    RECOVERY_CHECKS=""
+    for ns in "${AUTH_NS[@]}"; do
+        RECOVERY_CHECKS="${RECOVERY_CHECKS}   dig @${ns} _25._tcp.${MX_HOST} TLSA\n"
+    done
+    
+    # Only change if currently using DANE
+    if [ "$CURRENT_LEVEL" = "$DANE_ENFORCE_LEVEL" ] || [ "$CURRENT_LEVEL" = "dane-only" ]; then
+        echo "Temporarily relaxing DANE enforcement from '${CURRENT_LEVEL}' to '${DANE_FALLBACK_LEVEL}'..." >&2
+        postconf -e "smtp_tls_security_level = ${DANE_FALLBACK_LEVEL}"
+        postfix reload
+        
+        ALERT_MSG="════════════════════════════════════════════════════════════
+🚨 URGENT: DANE VALIDATION FAILURES DETECTED
+════════════════════════════════════════════════════════════
+
+Server: ${MX_HOST}
+Time: $(date)
+
+ACTION TAKEN:
+  smtp_tls_security_level changed from '${CURRENT_LEVEL}' to '${DANE_FALLBACK_LEVEL}'
+  (DANE enforcement temporarily disabled to ensure mail flow)
+
+$(echo -e "$SUMMARY")
+DETAILED ERRORS:
+────────────────────────────────────────────────────────────
+$(echo -e "$ERRORS")
+
+RECOVERY STEPS:
+────────────────────────────────────────────────────────────
+1. Check TLSA records on all authoritative nameservers:
+$(echo -e "$RECOVERY_CHECKS")
+2. Verify DNSSEC chain:
+   dig +dnssec +multi _25._tcp.${MX_HOST} TLSA
+   delv _25._tcp.${MX_HOST} TLSA
+
+3. Test manually with danesmtp:
+   ${DANESMTP} ${MX_HOST}              # Tests ML-DSA-65 (default)
+   ${DANESMTP} -s ecdsa ${MX_HOST}     # Tests ECDSA
+   ${DANESMTP} -s rsa ${MX_HOST}       # Tests RSA
+
+4. If you just updated DNS:
+   - Check zone serial on master: dig @${AUTH_NS[0]} ${DOMAIN} SOA
+   - Wait for slaves to sync (HE.net typically ~15 min)
+   - Check TTL on TLSA records: dig _25._tcp.${MX_HOST} TLSA
+
+5. Re-run this script to verify: $0
+
+6. Once all checks pass, restore DANE enforcement:
+   postconf -e 'smtp_tls_security_level = ${DANE_ENFORCE_LEVEL}'
+   postfix reload
+
+════════════════════════════════════════════════════════════
+This is an automated alert from ${HOSTNAME}
+════════════════════════════════════════════════════════════
+"
+        
+        # Send alerts via multiple channels
+        echo "$ALERT_MSG" | mail -s "🚨 URGENT: DANE Validation Failed on ${MX_HOST}" "$PRIMARY_EMAIL"
+        echo "$ALERT_MSG" | mail -s "🚨 URGENT: DANE Validation Failed on ${MX_HOST}" "$BACKUP_EMAIL"
+        
+        # Log to syslog
+        logger -t dane-monitor -p mail.err "DANE validation failed: DNSSEC=$DNSSEC_OK MLDSA=$MLDSA_OK ECDSA=$ECDSA_OK RSA=$RSA_OK - relaxed enforcement to '${DANE_FALLBACK_LEVEL}'"
+    else
+        # Not using DANE enforcement, just alert without changing config
+        ALERT_MSG="════════════════════════════════════════════════════════════
+⚠️  WARNING: DANE VALIDATION ISSUES DETECTED
+════════════════════════════════════════════════════════════
+
+Server: ${MX_HOST}
+Time: $(date)
+
+NOTE: smtp_tls_security_level is currently '${CURRENT_LEVEL}'
+      (not enforcing DANE, so no config change needed)
+
+$(echo -e "$SUMMARY")
+DETAILED ERRORS:
+────────────────────────────────────────────────────────────
+$(echo -e "$ERRORS")
+
+Check manually:
+$(echo -e "$RECOVERY_CHECKS")
+  ${DANESMTP} ${MX_HOST}
+  ${DANESMTP} -s ecdsa ${MX_HOST}
+  ${DANESMTP} -s rsa ${MX_HOST}
+
+════════════════════════════════════════════════════════════
+"
+        echo "$ALERT_MSG" | mail -s "⚠️  WARNING: DANE Validation Issues on ${MX_HOST}" "$PRIMARY_EMAIL"
+        logger -t dane-monitor -p mail.warning "DANE validation failed but not enforcing DANE (level=${CURRENT_LEVEL})"
+    fi
+    
+    exit 1
+else
+    echo "========================================" >&2
+    echo "✓ All DANE checks passed successfully" >&2
+    echo "  ✓ TLSA records consistent across all NS" >&2
+    echo "  ✓ DNSSEC validated" >&2
+    echo "  ✓ ML-DSA-65 certificate valid" >&2
+    echo "  ✓ ECDSA certificate valid" >&2
+    echo "  ✓ RSA certificate valid" >&2
+    echo "========================================" >&2
+    logger -t dane-monitor -p mail.info "DANE validation successful for all certificate types"
+    exit 0
+fi
